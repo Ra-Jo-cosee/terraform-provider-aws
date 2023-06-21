@@ -14,6 +14,7 @@ import (
 	sdkacctest "github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-provider-aws/internal/acctest"
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	"github.com/hashicorp/terraform-provider-aws/internal/create"
@@ -776,6 +777,49 @@ func TestAccMediaLiveChannel_disappears(t *testing.T) {
 					acctest.CheckResourceDisappears(ctx, acctest.Provider, tfmedialive.ResourceChannel(), resourceName),
 				),
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+func TestAccMediaLiveChannel_noDriftOnUnchangedMediaPackageOutputSettings(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	var channel medialive.DescribeChannelOutput
+	rName := sdkacctest.RandomWithPrefix(acctest.ResourcePrefix)
+	resourceName := "aws_medialive_channel.test"
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			acctest.PreCheck(ctx, t)
+			acctest.PreCheckPartitionHasService(t, names.MediaLiveEndpointID)
+			testAccChannelsPreCheck(ctx, t)
+		},
+		ErrorCheck:				  acctest.ErrorCheck(t, names.MediaLiveEndpointID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:			  testAccCheckChannelDestroy(ctx),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccChannelConfig_mediaPackageOutputSetting(rName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckChannelExists(ctx, resourceName, &channel),
+				),
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// TODO: Is this all we need?
+				Config: testAccChannelConfig_basic(rName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckChannelExists(ctx, resourceName, &channel),
+				),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
 			},
 		},
 	})
@@ -2076,4 +2120,147 @@ resource "aws_medialive_channel" "test" {
   }
 }
 `, rName, key1, value1, key2, value2))
+}
+
+func testAccChannelConfig_mediaPackageOutputSetting(rName string) string {
+    return fmt.Sprintf(`
+locals {
+  resource_prefix = "perpetual-drift-test"
+}
+
+terraform {
+  required_version = "1.4.6"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "4.67"
+    }
+  }
+}
+
+resource "aws_iam_role" "example" {
+  name                 = "${local.resource_prefix}-medialive-role"
+  description          = ""
+  max_session_duration = 3600
+  path                 = "/"
+  assume_role_policy   = <<EOF
+{
+  "Statement": [
+    {
+      "Action": "sts:AssumeRole",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "medialive.amazonaws.com"
+      }
+    }
+  ],
+  "Version": "2012-10-17"
+}
+EOF
+}
+
+resource "aws_iam_role_policy_attachment" "example_mediaPackage" {
+  role       = aws_iam_role.example.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSElementalMediaPackageReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "example_mediaLive" {
+  role       = aws_iam_role.example.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSElementalMediaLiveFullAccess"
+}
+
+
+resource "aws_media_package_channel" "example" {
+  channel_id = "${local.resource_prefix}-bbb"
+}
+
+resource "aws_medialive_input" "example" {
+  name = "${local.resource_prefix}-bbb"
+  type = "MP4_FILE"
+
+  sources {
+    url            = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+    username       = ""
+    password_param = ""
+  }
+}
+
+resource "aws_medialive_channel" "example" {
+  name          = "${local.resource_prefix}-bbb"
+  channel_class = "SINGLE_PIPELINE"
+  role_arn      = aws_iam_role.example.arn
+
+  destinations {
+    id = "mediapackage-output"
+    media_package_settings {
+      channel_id = aws_media_package_channel.example.id
+    }
+  }
+
+  input_specification {
+    codec            = "AVC"
+    input_resolution = "HD"
+    maximum_bitrate  = "MAX_20_MBPS"
+  }
+
+  input_attachments {
+    input_id              = aws_medialive_input.example.id
+    input_attachment_name = "BBB"
+
+    input_settings {
+      source_end_behavior = "LOOP"
+    }
+  }
+
+  encoder_settings {
+
+    audio_descriptions {
+      name                = "example-audio"
+      audio_selector_name = "Default"
+    }
+
+    video_descriptions {
+      name   = "example-video"
+      width  = 640
+      height = 360
+
+      codec_settings {
+        h264_settings {
+          framerate_control       = "SPECIFIED"
+          par_control             = "SPECIFIED"
+          framerate_numerator     = 50
+          framerate_denominator   = 1
+        }
+      }
+    }
+
+    timecode_config {
+      source = "EMBEDDED"
+    }
+
+    output_groups {
+      name = "livestream"
+
+      output_group_settings {
+        media_package_group_settings {
+          destination {
+            destination_ref_id = "mediapackage-output"
+          }
+        }
+      }
+
+      outputs {
+        output_name             = "output-name"
+        video_description_name  = "example-video"
+        audio_description_names = ["example-audio"]
+
+        output_settings {
+          media_package_output_settings {}
+        }
+      }
+    }
+  }
+}
+    `, rName)
 }
